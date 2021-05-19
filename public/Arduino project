@@ -1,0 +1,360 @@
+
+
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <avr/wdt.h>
+
+// Variable as part of the CPU sleep routine
+volatile int f_wdt=1;
+
+// Watchdog interrupt setup (executed when the watchdog times out)
+ISR(WDT_vect)
+{
+  if(f_wdt == 0)
+  {
+    f_wdt=1;
+  }
+  else
+  {
+    Serial.println("WDT Overrun!!!");
+  }
+}
+
+// Set up the sleep function
+void enterSleep(void)
+{
+  set_sleep_mode(SLEEP_MODE_PWR_SAVE);   /* EDIT: could also use SLEEP_MODE_PWR_DOWN for lowest power consumption. */
+  sleep_enable();
+  
+  /* Now enter sleep mode. */
+  sleep_mode();
+  
+  /* The program will continue from here after the WDT timeout*/
+  sleep_disable(); /* First thing to do is disable sleep. */
+  
+  /* Re-enable the peripherals. */
+  power_all_enable();
+}
+
+
+// Configure
+float bulk_overshoot = 14.90;   // Max voltage
+float bulk_norm = 14.50;  // Normal voltage
+float bulk_undershoot = 14.00;   // Min voltage
+
+float absorb_overshoot = 13.90;  // Max voltage
+float absorb_norm = 13.60; // Normal voltage
+float absorb_undershoot = 13.00; // Min voltage
+
+float overshoot = bulk_overshoot;  // Voltage that determines an overshoot
+float undershoot = bulk_undershoot; // Voltage that determines an undershoot
+
+int overshoot_step = 20;  // Number of pwm steps down to make if overshoot shoot occurs
+int undershoot_step = 10;  // Number of pwm steps up to make if undershoot shoot occurs
+
+float volts_target = bulk_norm; // Initial voltage target at startup
+
+int bulk_wait = 2500;      // Number of loops before moving to absorb
+
+float mode_reset = 13.00; // Voltage at which the mode will reset to bulk
+
+float failsafe = 15.00;   // Failsafe voltage where PWM will go to 0 instantly if detected over this voltage
+
+// Battery Volts
+int volts_pin = 0;
+float volts_input = 0;
+float volts = 0;
+float volts_average = 0; // Variable for the voltage averages
+float volts_ref = 5.06; // The reference voltage of the arduino power supply
+int volts_averages = 10; // number of averages to take (smoothing)
+float volts_r1 = 98200; //3260 + 3249 + 3254; // resistance of set 1 of the voltage divider
+float volts_r2 = 22040; // resistance of set 2 of the voltage divider
+int i = 0;
+
+// Solar Volts
+int solar_volts_pin = 1;
+float solar_volts_input = 0;
+float solar_volts = 0;
+float solar_volts_average = 0; // Variable for the voltage averages
+float solar_volts_ref = 5.01; // The reference voltage of the arduino power supply
+int solar_volts_averages = 10; // number of averages to take (smoothing)
+float solar_volts_r1 = 99000; //3260 + 3249 + 3254; // resistance of set 1 of the voltage divider
+float solar_volts_r2 = 21990; // resistance of set 2 of the voltage divider
+int solar_i = 0;
+
+// PWM set
+int pwm = 0;
+float pwm_percent = 0;
+
+// Mode set and counter set
+int mode = 2; // 2 = bulk, 1 = absorbsion, 0 = trickle
+int mode_counter = 0;
+
+// Set LED pins
+int r = 12;
+int g = 11;
+int b = 10;
+
+// Set flashing counter
+int flash_count = 0;
+int flash_count_max = 25;
+
+// Debugging:
+// Set debug to 1 to enable Serial Output
+int debug = 0;
+int display_count;
+
+
+
+
+
+// the setup routine runs once when you press reset:
+void setup() {           
+  // Set the LED pins to outputs  
+  pinMode(r, OUTPUT);
+  pinMode(g, OUTPUT);
+  pinMode(b, OUTPUT);
+  
+  // Turn on the LED's to show good power-up. They'll go out after the first loop.
+  digitalWrite(r, 1);
+  digitalWrite(g, 1);
+  digitalWrite(b, 1);  
+  
+  // Enable Serial if debug is on
+  if(debug == 1)
+  {
+    Serial.begin(115200);
+  }
+  
+  // Set up the watchdog timer
+  /* Clear the reset flag. */
+  MCUSR &= ~(1<<WDRF);
+  
+  /* In order to change WDE or the prescaler, we need to
+   * set WDCE (This will allow updates for 4 clock cycles).
+   */
+  WDTCSR |= (1<<WDCE) | (1<<WDE);
+
+  /* set new watchdog timeout prescaler value */
+  WDTCSR = 1<<WDP3 | 0<<WDP2; /* 4.0 seconds */
+  
+  /* Enable the WD interrupt (note no reset). */
+  WDTCSR |= _BV(WDIE);
+  
+  Serial.println("Initialisation complete.");
+  delay(100); //Allow for serial print to complete.  
+  
+  
+  clock_low(); // Lower the CPU speed to save power
+}
+
+
+// The CPU low clock
+void clock_low(){
+     CLKPR = 0x80;
+     //CLKPR = 0x00; // 16MHz     
+     //CLKPR = 0x01; // 8MHz     
+     //CLKPR = 0x02; // 4MHz     
+     CLKPR = 0x03; // 2MHz     
+     //CLKPR = 0x04; // 1MHz
+     //CLKPR = 0x05; // 512KHz
+     //CLKPR = 0x06; // 256KHz
+     //CLKPR = 0x07; // 128KHz    
+     delay(10);
+}
+
+// The CPU high clock
+void clock_high(){
+     CLKPR = 0x80;
+     CLKPR = 0x00; // 16MHz 
+     delay(10);  
+}
+
+
+// the loop routine runs over and over again forever:
+void loop() {
+    
+    clock_low();
+
+    // Get the voltage
+    volts = 0.0;
+    volts_average = 0;
+    // Get an average of the incoming voltage reading (smoothing)
+    for(i = 0; i < volts_averages; i++)
+    {
+      volts_average = volts_average + analogRead(volts_pin);
+    }
+    // Calculate the voltage using the voltage divider setup
+    volts_input = volts_average / volts_averages;
+    volts = ((volts_input * volts_ref) / 1023.0) / (volts_r2 / (volts_r1 + volts_r2));
+    
+    
+    // Get the solar voltage
+    solar_volts = 0.0;
+    solar_volts_average = 0;
+    // Get an average of the incoming voltage reading (smoothing)
+    for(solar_i = 0; solar_i < solar_volts_averages; solar_i++)
+    {
+      solar_volts_average = solar_volts_average + analogRead(solar_volts_pin);
+    }
+    // Calculate the voltage using the voltage divider setup
+    solar_volts_input = solar_volts_average / solar_volts_averages;
+    solar_volts = ((solar_volts_input * solar_volts_ref) / 1023.0) / (solar_volts_r2 / (solar_volts_r1 + solar_volts_r2));    
+
+
+    // This is the main regulation part
+    // Check for under/overshoot and over/under voltage
+    // Adjust PWM as needed
+    
+    // If under target...
+    if(volts < undershoot && pwm < (pwm - undershoot_step))
+    {
+      pwm = pwm + undershoot_step;
+    }
+    else if(volts < volts_target && pwm != 255)
+    {
+      pwm++; 
+    }
+    
+    // If over target...
+    if(volts > overshoot && pwm > overshoot_step)
+    {
+      pwm = pwm - overshoot_step;               
+    }
+    else if(volts > volts_target && pwm != 0)
+    {
+      pwm--; 
+    }
+     
+
+    
+    
+    // Check our mode and volts vs target
+    if(mode == 2 && volts >= volts_target)
+    {
+      // Increase counter
+      mode_counter++;
+      // If mode counter is greater than our wait time
+      if(mode_counter > bulk_wait)
+      {
+         // Move to mode 1 and set mode 1 voltages
+         volts_target = absorb_norm;
+         undershoot = absorb_undershoot;         
+         overshoot = absorb_overshoot;
+         mode = 1;
+         mode_counter = 0; 
+      }
+    }
+
+    // Reset mode - Reset back to Bulk charging mode if voltage drops below mode_reset volts
+    if(volts < mode_reset)
+    {
+      mode = 2;      
+      volts_target = bulk_norm;
+      undershoot = bulk_undershoot;         
+      overshoot = bulk_overshoot; 
+    }
+    
+    
+    
+    
+    // Failsafe - If the voltage is over 14.5v instantly cut off charging and rise slowly
+    if(volts > failsafe)
+      pwm = 0;
+      
+    if(solar_volts < volts)
+        pwm = 0;
+      
+    
+    // Set the PWM to the determined value and contrain between 0 and 255
+    pwm = constrain(pwm, 0, 255);
+    analogWrite(9,pwm);
+
+
+    
+    // Set what we want the LED to show
+    // Bulk (red)
+    if(mode == 1 && flash_count > (flash_count_max/1.1))
+    {
+       digitalWrite(r, 0);
+       digitalWrite(g, 1);
+       digitalWrite(b, 0);       
+    }
+    
+    // Absorb (green)
+    if(mode == 2 && flash_count > (flash_count_max/1.1))
+    {
+       digitalWrite(r, 1);
+       digitalWrite(g, 0);      
+       digitalWrite(b, 0);    
+    }
+    
+    // No or low solar input (blue), sleep the CPU if no solar input
+    //if(solar_volts < 10 && (solar_volts - 0.5) < volts && flash_count > (flash_count_max/1.1))
+    if(solar_volts < 10 && (solar_volts - 0.5) < volts)
+    {
+       digitalWrite(r, 0);
+       digitalWrite(g, 0);      
+       digitalWrite(b, 1);
+       delay(50);
+       digitalWrite(r, 0);
+       digitalWrite(g, 0);      
+       digitalWrite(b, 0);       
+       if(f_wdt == 1)
+       {
+         /* Don't forget to clear the flag. */
+         f_wdt = 0;
+         
+         /* Re-enter sleep mode. */
+         enterSleep();
+       }
+    }
+    
+    // If the counter has exceeded the max, turn LED off
+    if(flash_count > flash_count_max)
+    {
+       digitalWrite(r, 0);
+       digitalWrite(g, 0);
+       digitalWrite(b, 0);  
+       flash_count = 0;
+    }
+    flash_count++; // Increase the counter
+    
+    
+
+    // Debugging serial output
+    if(debug == 1)
+    {
+      if(display_count >= 0)
+      {    
+        Serial.print("Batt Volts: ");
+        Serial.print(volts);
+        Serial.print("v/");
+        Serial.print(volts_target);
+        Serial.print("v, ");
+        Serial.print("Solar Volts: ");
+        Serial.print(solar_volts);
+        Serial.print("v, ");    
+        Serial.print("PWM: ");
+        Serial.print(pwm);
+        Serial.print("(");
+        pwm_percent = 100 * ((float)pwm / 255);    
+        Serial.print(pwm_percent);        
+        Serial.print("%),");
+        Serial.print(" Mode: ");
+        if(mode == 2)
+          Serial.print("Bulk");
+        if(mode == 1)
+          Serial.print("Absorb");  
+        Serial.print(", Count: ");
+        Serial.print(mode_counter);  
+        Serial.print("/");
+        Serial.print(bulk_wait);
+        Serial.println("");
+        delay(20);    
+        display_count=0;
+      }
+      display_count++;
+    }
+    
+}
